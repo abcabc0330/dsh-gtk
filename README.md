@@ -22,7 +22,13 @@ background.
 - **Launch token recovery** — if the dsh web server answers `401`, the token
   printed by `dsh web` is recovered from the user journal and the page is
   reloaded with it (kept per cookie jar, so it only happens once).
-- **Keyboard** — `Ctrl+R` reload, `F11` fullscreen.
+- **Keyboard** — `Ctrl+R` reload, `F11` fullscreen, `F8` hide/show (in-window;
+  a compositor global binding normally takes the key first, see below).
+- **Single instance** — a second launch does not open a second window; it
+  raises the running one over the session bus.
+- **`--toggle`** — `dsh-gtk --toggle` asks the running instance to hide itself
+  if shown, or show itself if hidden, and starts it when nothing is running.
+  This is what makes a compositor keybinding possible on Wayland.
 - **Waits for the StatusNotifierWatcher** (waybar / any SNI host) before
   registering the tray item, mirroring magpie's `ExecStartPre` logic.
 
@@ -50,11 +56,36 @@ gcc -O2 -Wall -Wextra -o dsh-gtk dsh-gtk.c \
 
 ```sh
 dsh-gtk [url]          # default http://127.0.0.1:3080/
+dsh-gtk --toggle       # hide if shown, show if hidden, start if not running
+dsh-gtk --version
+dsh-gtk --help
 ```
 
 The tray icon is looked up in `$XDG_DATA_HOME/dsh-gtk/dsh-tray.png`
 (usually `~/.local/share/dsh-gtk/dsh-tray.png`) if present, otherwise a theme
 icon name (`utilities-terminal`) is used.
+
+## Global show/hide shortcut
+
+On Wayland a compositor grabs global shortcuts before any window sees them, so
+an in-window accelerator cannot be the portable answer. Instead, let the
+compositor run `--toggle`; it forwards one D-Bus call to the running instance
+and exits (or starts it when nothing is running).
+
+```sh
+# sway / i3 (--no-repeat matters: without it a held key fires once per repeat,
+# which toggles the window back and forth and looks like "nothing happened")
+bindsym --no-repeat F8 exec dsh-gtk --toggle
+
+# Hyprland
+bind = , F8, exec, dsh-gtk --toggle
+
+# GNOME: Settings → Keyboard → Custom Shortcuts, command `dsh-gtk --toggle`
+# KDE:   System Settings → Shortcuts → Custom, command `dsh-gtk --toggle`
+```
+
+The exported interface is `org.dsh.Gtk` at `/org/dsh/Gtk`
+(`Toggle`, `Activate`), so scripts can call it directly with `gdbus`.
 
 ## Tray behavior
 
@@ -64,6 +95,8 @@ icon name (`utilities-terminal`) is used.
 | Tray left-click     | Show and focus the window                |
 | Tray menu "显示窗口" | Show and focus the window                |
 | Tray menu "退出"     | Quit the process and remove the tray item|
+| Second launch       | Raise the running window (no duplicate)  |
+| `--toggle`          | Hide / show / start as described above   |
 
 ## Autostart (systemd user service, optional)
 

@@ -12,18 +12,34 @@
  * - Tray left-click shows/focuses the window; right-click menu: Show / Quit.
  * - On startup it waits for org.kde.StatusNotifierWatcher (waybar) before
  *   registering the indicator, mirroring magpie's ExecStartPre logic.
+ * - Single instance: a second launch talks to the running process over the
+ *   session bus instead of opening a second window.
+ * - `dsh-gtk --toggle` asks the running instance to hide/show itself, so a
+ *   compositor keybinding (sway, i3, Hyprland, KDE, GNOME) can drive the
+ *   window even though global shortcuts never reach the application.
  *
  * Build:
  *   gcc -O2 -Wall -Wextra -o dsh-gtk dsh-gtk.c \
  *       $(pkg-config --cflags --libs gtk+-3.0 webkit2gtk-4.1 ayatana-appindicator3-0.1)
+ *
+ * Usage:
+ *   dsh-gtk [url]        open the window (or raise the running one)
+ *   dsh-gtk --toggle     hide the window if shown, show it if hidden;
+ *                        starts it when nothing is running
+ *   dsh-gtk --version
  */
 #define _GNU_SOURCE
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
 #include <libayatana-appindicator/app-indicator.h>
+#include <gio/gio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef DSH_GTK_VERSION
+#define DSH_GTK_VERSION "0.1.3"
+#endif
 
 #define DEFAULT_URL "http://127.0.0.1:3080/"
 #define APP_DIR "dsh-gtk"
@@ -161,6 +177,123 @@ static void on_toggle_accel(gpointer unused) {
 }
 
 
+/* --- single instance + external toggle bridge (session bus) ---
+ *
+ * On Wayland a compositor handles global shortcuts itself, so a key bound to
+ * this application never reaches its window. The portable answer is to let a
+ * keybinding run a *second* `dsh-gtk` with `--toggle`: it connects to the bus,
+ * finds the well-known name below, forwards one method call and exits.
+ *
+ * The same well-known name doubles as the single-instance guard, so a plain
+ * second launch raises the existing window instead of opening another one.
+ */
+#define BUS_NAME   "org.dsh.Gtk"
+#define OBJ_PATH   "/org/dsh/Gtk"
+#define IFACE_NAME "org.dsh.Gtk"
+
+static const gchar introspection_xml[] =
+    "<node>"
+    "  <interface name='" IFACE_NAME "'>"
+    "    <method name='Toggle'/>"
+    "    <method name='Activate'/>"
+    "  </interface>"
+    "</node>";
+
+/* Hide if shown, show+focus if hidden: what both F8 and `--toggle` do. */
+static void toggle_visibility(void) {
+    if (gtk_widget_get_visible(window))
+        gtk_widget_hide(window);
+    else
+        show_and_focus();
+}
+
+/* Exported methods, invoked by a second process. */
+static void on_dbus_method_call(GDBusConnection *conn, const gchar *sender,
+                                const gchar *path, const gchar *iface,
+                                const gchar *method, GVariant *params,
+                                GDBusMethodInvocation *inv, gpointer unused) {
+    (void)conn; (void)sender; (void)path; (void)iface; (void)params; (void)unused;
+    if (g_strcmp0(method, "Toggle") == 0)
+        toggle_visibility();
+    else if (g_strcmp0(method, "Activate") == 0)
+        show_and_focus();
+    g_dbus_method_invocation_return_value(inv, NULL);
+}
+
+static const GDBusInterfaceVTable dbus_vtable = {
+    on_dbus_method_call, NULL, NULL, {0}
+};
+
+/* Session bus, or NULL when D-Bus is unavailable (the app then just runs,
+ * losing only the single-instance and --toggle behaviour). */
+static GDBusConnection *get_session_bus(void) {
+    GError *err = NULL;
+    GDBusConnection *bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
+    if (!bus && err) {
+        g_printerr("dsh-gtk: no session bus (%s)\n", err->message);
+        g_clear_error(&err);
+    }
+    return bus;
+}
+
+/* Claim BUS_NAME without queueing behind an existing owner.
+ * Returns 1 (we own it), 3 (another instance owns it) or 0 on error. */
+static int request_bus_name(GDBusConnection *bus) {
+    GError *err = NULL;
+    GVariant *ret;
+    guint32 reply = 0;
+
+    ret = g_dbus_connection_call_sync(
+        bus, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "RequestName",
+        g_variant_new("(su)", BUS_NAME, 4u /* DBUS_NAME_FLAG_DO_NOT_QUEUE */),
+        G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 2000, NULL, &err);
+    if (ret) {
+        g_variant_get(ret, "(u)", &reply);
+        g_variant_unref(ret);
+    }
+    if (err) g_clear_error(&err);
+    return (int)reply;
+}
+
+/* Publish the interface on OBJ_PATH so other processes can call us. */
+static void export_dbus_interface(GDBusConnection *bus) {
+    GDBusNodeInfo *info = NULL;
+    GError *err = NULL;
+
+    info = g_dbus_node_info_new_for_xml(introspection_xml, &err);
+    if (!info) {
+        g_printerr("dsh-gtk: bad introspection XML: %s\n", err->message);
+        g_clear_error(&err);
+        return;
+    }
+    g_dbus_connection_register_object(bus, OBJ_PATH, info->interfaces[0],
+                                      &dbus_vtable, NULL, NULL, &err);
+    if (err) {
+        g_printerr("dsh-gtk: cannot export %s: %s\n", IFACE_NAME, err->message);
+        g_clear_error(&err);
+    }
+    g_dbus_node_info_unref(info);
+}
+
+/* Ask the running instance to run `method`; TRUE when it answered. */
+static gboolean ask_running_instance(const char *method) {
+    GDBusConnection *bus = get_session_bus();
+    GError *err = NULL;
+    GVariant *ret;
+    gboolean ok;
+
+    if (!bus) return FALSE;
+    ret = g_dbus_connection_call_sync(bus, BUS_NAME, OBJ_PATH, IFACE_NAME,
+                                      method, NULL, NULL,
+                                      G_DBUS_CALL_FLAGS_NONE, 2000, NULL, &err);
+    ok = ret != NULL;
+    if (ret) g_variant_unref(ret);
+    if (err) g_clear_error(&err);
+    return ok;
+}
+
+
 /* --- wait for StatusNotifierWatcher (waybar) like magpie does --- */
 static gboolean wait_for_watcher(void) {
     gboolean ok = FALSE;
@@ -217,10 +350,61 @@ static void setup_tray(void) {
     g_timeout_add(1000, watcher_poll, NULL);
 }
 
+static void usage(FILE *out) {
+    fprintf(out,
+        "Usage: dsh-gtk [OPTION]... [URL]\n"
+        "\n"
+        "  --toggle     hide the running window if shown, show it if hidden;\n"
+        "               starts dsh-gtk when nothing is running\n"
+        "  --version    print the version and exit\n"
+        "  -h, --help   show this help and exit\n"
+        "\n"
+        "A plain launch raises the already running instance instead of\n"
+        "opening a second window. Bind --toggle to a key in the compositor:\n"
+        "\n"
+        "  sway:     bindsym --no-repeat F8 exec dsh-gtk --toggle\n"
+        "  Hyprland: bind = , F8, exec, dsh-gtk --toggle\n");
+}
+
 int main(int argc, char **argv) {
+    gboolean want_toggle = FALSE;
+    GDBusConnection *bus;
+    int owner;
+
+    /* GTK consumes its own options; ours stay in argv. */
     gtk_init(&argc, &argv);
 
-    base_url = argc > 1 ? g_strdup(argv[1]) : g_strdup(DEFAULT_URL);
+    base_url = g_strdup(DEFAULT_URL);
+    for (int i = 1; i < argc; i++) {
+        if (g_strcmp0(argv[i], "--toggle") == 0) {
+            want_toggle = TRUE;
+        } else if (g_strcmp0(argv[i], "--version") == 0) {
+            printf("dsh-gtk %s\n", DSH_GTK_VERSION);
+            g_free(base_url);
+            return 0;
+        } else if (g_strcmp0(argv[i], "--help") == 0 || g_strcmp0(argv[i], "-h") == 0) {
+            usage(stdout);
+            g_free(base_url);
+            return 0;
+        } else if (argv[i][0] != '-') {
+            g_free(base_url);
+            base_url = g_strdup(argv[i]);
+        }
+    }
+
+    /* Single instance: whoever owns BUS_NAME is the running window. A second
+     * process forwards Toggle/Activate there and exits before touching GTK. */
+    bus = get_session_bus();
+    if (bus) {
+        owner = request_bus_name(bus);
+        if (owner == 3) {                       /* already running */
+            gboolean ok = ask_running_instance(want_toggle ? "Toggle" : "Activate");
+            g_free(base_url);
+            return ok ? 0 : 1;
+        }
+        if (owner == 1)                         /* we are the one instance */
+            export_dbus_interface(bus);
+    }
 
     /* Tray icon: search $XDG_DATA_HOME/dsh-gtk/ then each $XDG_DATA_DIRS/dsh-gtk/
      * for dsh-tray.png; fall back to a theme icon name. This lets the AUR package
@@ -274,6 +458,7 @@ int main(int argc, char **argv) {
 
     gtk_main();
 
+    if (bus) g_object_unref(bus);
     g_free(cache_dir);
     g_free(data_dir);
     g_free(base_url);

@@ -2,18 +2,21 @@
 # Contributor: abcabc0330 <liqiang0330@gmail.com>
 
 pkgname=dsh-gtk
-pkgver=0.1.0
+pkgver=0.1.3
 pkgrel=1
-pkgdesc="Native GTK3 + WebKitGTK window for the dsh web UI with StatusNotifierItem tray residency"
+pkgdesc="GTK3+WebKitGTK tray shell for the dsh web UI (front-end window only; install dsh backend separately, e.g. deepseek-harness-bin)"
 arch=('x86_64')
 url="https://github.com/abcabc0330/dsh-gtk"
 license=('MIT')
+install='dsh-gtk.install'
 depends=('gtk3' 'webkit2gtk-4.1' 'libayatana-appindicator')
 makedepends=('pkg-config')
 provides=('dsh-gtk')
 conflicts=('dsh-gtk')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/abcabc0330/dsh-gtk/archive/v$pkgver.tar.gz")
-sha256sums=('7eade0304178646f8a4b00b62f1eb26d31ab7e93d077ca8199e106980f8212a9')
+# Real checksum is kept in the AUR repository; TAG archives cannot be hashed
+# before the tag exists, so this copy skips verification.
+sha256sums=('SKIP')
 
 
 prepare() {
@@ -22,7 +25,7 @@ prepare() {
 
 build() {
     cd "$pkgname-$pkgver"
-    gcc -O2 -Wall -Wextra -o dsh-gtk dsh-gtk.c \
+    gcc -O2 -Wall -Wextra -DDSH_GTK_VERSION='"'"$pkgver"'"' -o dsh-gtk dsh-gtk.c \
         $(pkg-config --cflags --libs gtk+-3.0 webkit2gtk-4.1 ayatana-appindicator3-0.1)
 }
 
