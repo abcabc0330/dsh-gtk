@@ -1,5 +1,11 @@
 # dsh-gtk
 
+> ⚠️ **This is only a shell (front-end window).** It does **not** bundle the
+> dsh backend. You must install and run the dsh web server yourself (typically
+> `deepseek-harness-bin` from the AUR, or `npm i -g @deepseek-ai/dsh`), then
+> point this window at it. Without a running `dsh web`, the window shows only a
+> blank page.
+
 A small native window for the [dsh](https://github.com/DeepSeek/dsh) web UI,
 built with **GTK3 + WebKitGTK**, that stays resident in the system tray.
 
@@ -25,8 +31,13 @@ background.
 - GTK3 (`gtk3`)
 - WebKitGTK 4.1 (`webkit2gtk-4.1`)
 - Ayatana AppIndicator (`libayatana-appindicator3`)
-- `dsh web` running (usually `http://127.0.0.1:3080/`)
+- **The dsh backend (not included)** — install `deepseek-harness-bin`
+  from the AUR (or `npm i -g @deepseek-ai/dsh`), then run `dsh web` so it
+  serves `http://127.0.0.1:3080/`
 - An SNI host in the tray (waybar, etc.)
+
+> 💡 **Tip:** `dsh-gtk` is useless on its own. It is a window that points at a
+> `dsh web` server — install and start the backend first, then launch this.
 
 ## Build
 
