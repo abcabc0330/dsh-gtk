@@ -150,6 +150,17 @@ static gboolean fullscreen_accel(GtkWidget *w, GdkEventKey *ev, gpointer unused)
     return FALSE;
 }
 
+/* F8 toggles window visibility: hide to tray if shown, show+focus if hidden.
+ * Registered as a window-level accel so WebKit cannot swallow the key. */
+static void on_toggle_accel(gpointer unused) {
+    (void)unused;
+    if (gtk_widget_get_visible(window))
+        gtk_widget_hide(window);
+    else
+        show_and_focus();
+}
+
+
 /* --- wait for StatusNotifierWatcher (waybar) like magpie does --- */
 static gboolean wait_for_watcher(void) {
     gboolean ok = FALSE;
@@ -251,11 +262,16 @@ int main(int argc, char **argv) {
     g_signal_connect(window, "delete-event", G_CALLBACK(on_delete_event), NULL);
     g_signal_connect(window, "key-press-event", G_CALLBACK(reload_accel), NULL);
     g_signal_connect(window, "key-press-event", G_CALLBACK(fullscreen_accel), NULL);
-
+    GtkAccelGroup *ag = gtk_accel_group_new();
+    gtk_accel_group_connect(ag, GDK_KEY_F8, (GdkModifierType)0, 0,
+                            g_cclosure_new(G_CALLBACK(on_toggle_accel), NULL, NULL));
+    gtk_window_add_accel_group(GTK_WINDOW(window), ag);
+    g_object_unref(ag);
     setup_tray();
 
     webkit_web_view_load_uri(view, base_url);
     gtk_widget_show_all(window);
+
     gtk_main();
 
     g_free(cache_dir);
