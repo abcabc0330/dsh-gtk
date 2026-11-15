@@ -17,6 +17,10 @@
  * - `dsh-gtk --toggle` asks the running instance to hide/show itself, so a
  *   compositor keybinding (sway, i3, Hyprland, KDE, GNOME) can drive the
  *   window even though global shortcuts never reach the application.
+ * - Ctrl+F opens an in-page find bar (WebKitFindController): live highlight,
+ *   match count, Enter/Shift+Enter or the arrows to step, Esc to dismiss.
+ *   The accelerator lives in the window's accel group so a page that binds
+ *   Ctrl+F cannot swallow it.
  *
  * Build:
  *   gcc -O2 -Wall -Wextra -o dsh-gtk dsh-gtk.c \
@@ -38,7 +42,7 @@
 #include <string.h>
 
 #ifndef DSH_GTK_VERSION
-#define DSH_GTK_VERSION "0.1.3"
+#define DSH_GTK_VERSION "0.1.4"
 #endif
 
 #define DEFAULT_URL "http://127.0.0.1:3080/"
@@ -53,6 +57,13 @@ static char *base_url;
 static char *tray_icon;
 static gboolean token_retry_done = FALSE;
 static gboolean quit_requested = FALSE;
+
+/* --- find bar (Ctrl+F) --- */
+static GtkWidget *find_bar;
+static GtkWidget *find_entry;
+static GtkWidget *find_status;
+static WebKitFindController *find_ctl;
+static gboolean find_bar_shown = FALSE;
 
 /* --- token recovery --- */
 static char *read_token_from_journal(void) {
@@ -141,6 +152,212 @@ static void on_tray_quit(GtkMenuItem *item, gpointer unused) {
 static void on_indicator_activate(AppIndicator *ind, gpointer unused) {
     (void)ind; (void)unused;
     show_and_focus();
+}
+
+/* --- find bar (Ctrl+F) ---
+ *
+ * WebKitFindController highlights the matches inside the page; this bar only
+ * collects the query and reports how many matches the controller found. It is
+ * an overlay child, so it floats above the page instead of reflowing it.
+ */
+static void find_next_match(void) {
+    if (find_ctl && find_bar_shown) webkit_find_controller_search_next(find_ctl);
+}
+
+static void find_prev_match(void) {
+    if (find_ctl && find_bar_shown) webkit_find_controller_search_previous(find_ctl);
+}
+
+static void find_stop(void) {
+    if (find_ctl) webkit_find_controller_search_finish(find_ctl);
+}
+
+static void find_close(void);
+static void on_find_accel(gpointer unused);
+
+/* Esc closes the bar from the page as well: while the bar is up the web view
+ * is not focusable, so this only fires when the page still holds the keyboard
+ * (some pages refocus themselves from JS). */
+static gboolean on_find_window_key(GtkWidget *widget, GdkEventKey *event, gpointer unused) {
+    (void)widget; (void)unused;
+    if (find_bar_shown && event->keyval == GDK_KEY_Escape) {
+        find_close();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void find_close(void) {
+    find_stop();
+    if (find_bar) gtk_widget_hide(find_bar);
+    find_bar_shown = FALSE;
+    if (view) {
+        gtk_widget_set_can_focus(GTK_WIDGET(view), TRUE);
+        gtk_widget_grab_focus(GTK_WIDGET(view));
+    }
+}
+
+static void find_run(void) {
+    const char *text;
+
+    if (!find_ctl || !find_entry) return;
+    text = gtk_entry_get_text(GTK_ENTRY(find_entry));
+    if (text == NULL || *text == '\0') {
+        find_stop();
+        gtk_label_set_text(GTK_LABEL(find_status), "");
+        return;
+    }
+    webkit_find_controller_search(find_ctl, text,
+        WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE | WEBKIT_FIND_OPTIONS_WRAP_AROUND,
+        G_MAXUINT);
+}
+
+/* Focus and selection are applied on the next idle turn: the overlay child is
+ * only mapped in this iteration, and the page grabs focus back if we ask for
+ * it inside the accel handler. */
+static gboolean focus_find_entry(gpointer unused) {
+    (void)unused;
+    if (!find_bar_shown) return G_SOURCE_REMOVE;
+    gtk_window_set_focus(GTK_WINDOW(window), find_entry);
+    gtk_widget_grab_focus(find_entry);
+    gtk_editable_select_region(GTK_EDITABLE(find_entry), 0, -1);
+    return G_SOURCE_REMOVE;
+}
+
+static void find_open(void) {
+    if (!find_bar) return;
+    gtk_widget_show(find_bar);
+    find_bar_shown = TRUE;
+    /* The page can grab the focus back (its composer autofocuses when a task
+     * finishes); while searching, keystrokes must belong to the entry. */
+    if (view) gtk_widget_set_can_focus(GTK_WIDGET(view), FALSE);
+    g_idle_add(focus_find_entry, NULL);
+    find_run();
+}
+
+/* Ctrl+F while the bar is up re-focuses it, like a browser. */
+static void on_find_accel(gpointer unused) {
+    (void)unused;
+    if (find_bar_shown) g_idle_add(focus_find_entry, NULL);
+    else find_open();
+}
+
+static void on_find_changed(GtkSearchEntry *entry, gpointer unused) {
+    (void)entry; (void)unused;
+    find_run();
+}
+
+static void on_find_next_signal(GtkSearchEntry *entry, gpointer unused) {
+    (void)entry; (void)unused;
+    find_next_match();
+}
+
+static void on_find_prev_signal(GtkSearchEntry *entry, gpointer unused) {
+    (void)entry; (void)unused;
+    find_prev_match();
+}
+
+static void on_find_stop_signal(GtkSearchEntry *entry, gpointer unused) {
+    (void)entry; (void)unused;
+    find_close();
+}
+
+static void on_find_next_clicked(GtkButton *b, gpointer unused) {
+    (void)b; (void)unused;
+    find_next_match();
+}
+
+static void on_find_prev_clicked(GtkButton *b, gpointer unused) {
+    (void)b; (void)unused;
+    find_prev_match();
+}
+
+static void on_find_close_clicked(GtkButton *b, gpointer unused) {
+    (void)b; (void)unused;
+    find_close();
+}
+
+/* Return steps forward, Shift+Return backward. Handled here rather than on
+ * "activate" because that signal cannot tell the two apart. */
+static gboolean on_find_key(GtkWidget *w, GdkEventKey *ev, gpointer unused) {
+    (void)w; (void)unused;
+    if (ev->keyval == GDK_KEY_Return || ev->keyval == GDK_KEY_KP_Enter) {
+        if (ev->state & GDK_SHIFT_MASK) find_prev_match();
+        else find_next_match();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void on_find_found(WebKitFindController *ctl, guint count, gpointer unused) {
+    (void)ctl; (void)unused;
+    char *text = g_strdup_printf("%u 处", count);
+    gtk_label_set_text(GTK_LABEL(find_status), text);
+    g_free(text);
+}
+
+static void on_find_failed(WebKitFindController *ctl, gpointer unused) {
+    (void)ctl; (void)unused;
+    gtk_label_set_text(GTK_LABEL(find_status), "无匹配");
+}
+
+/* A navigation drops the previous matches; close so the bar cannot claim a
+ * count that belongs to the old page. */
+static void on_view_load_changed(WebKitWebView *v, WebKitLoadEvent ev, gpointer unused) {
+    (void)v; (void)unused;
+    if (ev == WEBKIT_LOAD_STARTED && find_bar_shown) find_close();
+}
+
+static void setup_find_bar(GtkOverlay *overlay) {
+    GtkWidget *prev_btn, *next_btn, *close_btn;
+    GtkStyleContext *sc;
+
+    find_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    sc = gtk_widget_get_style_context(find_bar);
+    gtk_style_context_add_class(sc, GTK_STYLE_CLASS_TOOLBAR);
+    gtk_style_context_add_class(sc, "osd");
+    gtk_widget_set_halign(find_bar, GTK_ALIGN_END);
+    gtk_widget_set_valign(find_bar, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(find_bar, 10);
+    gtk_widget_set_margin_start(find_bar, 10);
+    gtk_widget_set_margin_end(find_bar, 14);
+
+    find_entry = gtk_search_entry_new();
+    gtk_entry_set_width_chars(GTK_ENTRY(find_entry), 22);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(find_entry), "在页面中查找");
+    g_signal_connect(find_entry, "search-changed", G_CALLBACK(on_find_changed), NULL);
+    g_signal_connect(find_entry, "next-match", G_CALLBACK(on_find_next_signal), NULL);
+    g_signal_connect(find_entry, "previous-match", G_CALLBACK(on_find_prev_signal), NULL);
+    g_signal_connect(find_entry, "stop-search", G_CALLBACK(on_find_stop_signal), NULL);
+    g_signal_connect(find_entry, "key-press-event", G_CALLBACK(on_find_key), NULL);
+    gtk_box_pack_start(GTK_BOX(find_bar), find_entry, FALSE, FALSE, 0);
+
+    find_status = gtk_label_new("");
+    gtk_style_context_add_class(gtk_widget_get_style_context(find_status),
+                                GTK_STYLE_CLASS_DIM_LABEL);
+    gtk_widget_set_margin_start(find_status, 6);
+    gtk_widget_set_margin_end(find_status, 6);
+    gtk_box_pack_start(GTK_BOX(find_bar), find_status, FALSE, FALSE, 0);
+
+    prev_btn = gtk_button_new_from_icon_name("go-up-symbolic", GTK_ICON_SIZE_BUTTON);
+    next_btn = gtk_button_new_from_icon_name("go-down-symbolic", GTK_ICON_SIZE_BUTTON);
+    close_btn = gtk_button_new_from_icon_name("window-close-symbolic", GTK_ICON_SIZE_BUTTON);
+    gtk_button_set_relief(GTK_BUTTON(prev_btn), GTK_RELIEF_NONE);
+    gtk_button_set_relief(GTK_BUTTON(next_btn), GTK_RELIEF_NONE);
+    gtk_button_set_relief(GTK_BUTTON(close_btn), GTK_RELIEF_NONE);
+    gtk_widget_set_tooltip_text(prev_btn, "上一个匹配 (Shift+Enter)");
+    gtk_widget_set_tooltip_text(next_btn, "下一个匹配 (Enter)");
+    gtk_widget_set_tooltip_text(close_btn, "关闭 (Esc)");
+    g_signal_connect(prev_btn, "clicked", G_CALLBACK(on_find_prev_clicked), NULL);
+    g_signal_connect(next_btn, "clicked", G_CALLBACK(on_find_next_clicked), NULL);
+    g_signal_connect(close_btn, "clicked", G_CALLBACK(on_find_close_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(find_bar), prev_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(find_bar), next_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(find_bar), close_btn, FALSE, FALSE, 0);
+
+    gtk_overlay_add_overlay(overlay, find_bar);
+    gtk_widget_show_all(find_bar);
+    gtk_widget_hide(find_bar);
 }
 
 /* --- keyboard --- */
@@ -363,7 +580,11 @@ static void usage(FILE *out) {
         "opening a second window. Bind --toggle to a key in the compositor:\n"
         "\n"
         "  sway:     bindsym --no-repeat F8 exec dsh-gtk --toggle\n"
-        "  Hyprland: bind = , F8, exec, dsh-gtk --toggle\n");
+        "  Hyprland: bind = , F8, exec, dsh-gtk --toggle\n"
+        "\n"
+        "In the window: Ctrl+F finds text in the page (Enter/Shift+Enter or\n"
+        "the arrows step through matches, Esc closes), Ctrl+R reloads and\n"
+        "F11 toggles fullscreen.\n");
 }
 
 int main(int argc, char **argv) {
@@ -438,23 +659,38 @@ int main(int argc, char **argv) {
     gtk_window_set_default_size(GTK_WINDOW(window), 1280, 860);
     gtk_window_set_icon_name(GTK_WINDOW(window), "utilities-terminal");
 
+    GtkWidget *overlay = gtk_overlay_new();
     view = WEBKIT_WEB_VIEW(webkit_web_view_new_with_context(ctx));
-    gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(view));
+    gtk_container_add(GTK_CONTAINER(overlay), GTK_WIDGET(view));
+    gtk_container_add(GTK_CONTAINER(window), overlay);
 
     g_signal_connect(view, "resource-load-started",
                      G_CALLBACK(on_resource_load_started), NULL);
     g_signal_connect(window, "delete-event", G_CALLBACK(on_delete_event), NULL);
     g_signal_connect(window, "key-press-event", G_CALLBACK(reload_accel), NULL);
     g_signal_connect(window, "key-press-event", G_CALLBACK(fullscreen_accel), NULL);
+
+    find_ctl = webkit_web_view_get_find_controller(view);
+    g_signal_connect(find_ctl, "found-text", G_CALLBACK(on_find_found), NULL);
+    g_signal_connect(find_ctl, "failed-to-find-text", G_CALLBACK(on_find_failed), NULL);
+    g_signal_connect(view, "load-changed", G_CALLBACK(on_view_load_changed), NULL);
+    setup_find_bar(GTK_OVERLAY(overlay));
+
     GtkAccelGroup *ag = gtk_accel_group_new();
     gtk_accel_group_connect(ag, GDK_KEY_F8, (GdkModifierType)0, 0,
                             g_cclosure_new(G_CALLBACK(on_toggle_accel), NULL, NULL));
+    gtk_accel_group_connect(ag, GDK_KEY_f, GDK_CONTROL_MASK, 0,
+                            g_cclosure_new(G_CALLBACK(on_find_accel), NULL, NULL));
     gtk_window_add_accel_group(GTK_WINDOW(window), ag);
     g_object_unref(ag);
+    g_signal_connect(window, "key-press-event", G_CALLBACK(on_find_window_key), NULL);
     setup_tray();
 
     webkit_web_view_load_uri(view, base_url);
     gtk_widget_show_all(window);
+    /* show_all() recurses into the overlay, so the find bar must be hidden
+     * again after it. */
+    gtk_widget_hide(find_bar);
 
     gtk_main();
 

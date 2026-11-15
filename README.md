@@ -22,8 +22,14 @@ background.
 - **Launch token recovery** — if the dsh web server answers `401`, the token
   printed by `dsh web` is recovered from the user journal and the page is
   reloaded with it (kept per cookie jar, so it only happens once).
-- **Keyboard** — `Ctrl+R` reload, `F11` fullscreen, `F8` hide/show (in-window;
-  a compositor global binding normally takes the key first, see below).
+- **Keyboard** — `Ctrl+R` reload, `Ctrl+F` find in page, `F11` fullscreen,
+  `F8` hide/show (in-window; a compositor global binding normally takes the
+  key first, see below).
+- **Find in page (`Ctrl+F`)** — a browser-style bar floats over the top-right
+  corner: WebKit highlights every match, the counter shows `N 处` (or
+  `无匹配`), `Enter` / `Shift+Enter` (or the arrow buttons) step through the
+  matches, and `Esc` or the `×` button dismisses it. The bar does not reflow
+  the page, and it closes itself when the page navigates.
 - **Single instance** — a second launch does not open a second window; it
   raises the running one over the session bus.
 - **`--toggle`** — `dsh-gtk --toggle` asks the running instance to hide itself
@@ -64,6 +70,13 @@ dsh-gtk --help
 The tray icon is looked up in `$XDG_DATA_HOME/dsh-gtk/dsh-tray.png`
 (usually `~/.local/share/dsh-gtk/dsh-tray.png`) if present, otherwise a theme
 icon name (`utilities-terminal`) is used.
+
+## Find in page
+
+`Ctrl+F` opens the find bar, `Ctrl+F` again just refocuses it (and reselects
+the query). Matching is case-insensitive and wraps around. While the bar is
+open the web view does not take keyboard focus, so the page's own composer
+cannot steal the keystrokes and `Esc` always closes the bar.
 
 ## Global show/hide shortcut
 
